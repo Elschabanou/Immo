@@ -1,0 +1,389 @@
+from __future__ import annotations
+
+import argparse
+import html
+import os
+import smtplib
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_DB_PATH = BASE_DIR / "kleinanzeigen_listings.db"
+DOTENV_PATH = BASE_DIR / ".env"
+
+FREQUENCY_DAYS = {
+    "daily": 1,
+    "weekly": 7,
+    "biweekly": 14,
+    "monthly": 30,
+}
+
+
+@dataclass
+class MailConfig:
+    smtp_host: str
+    smtp_port: int
+    smtp_user: str
+    smtp_password: str
+    from_email: str
+    subject: str
+    body: str
+
+
+def load_dotenv_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1]
+
+        os.environ.setdefault(key, value)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Sendet faellige Abo-E-Mails und plant den naechsten Versandzeitpunkt."
+    )
+    parser.add_argument(
+        "--db",
+        default=os.getenv("DB_PATH", str(DEFAULT_DB_PATH)),
+        help="Pfad zur SQLite-Datenbank",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Keine E-Mails senden, nur zeigen, was gesendet werden wuerde.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximalzahl zu verarbeitender Abos pro Lauf.",
+    )
+    return parser.parse_args()
+
+
+def get_mail_config() -> MailConfig:
+    load_dotenv_file(DOTENV_PATH)
+
+    smtp_user = os.getenv("SMTP_USER", "porschehousing@gmail.com").strip()
+    smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
+
+    return MailConfig(
+        smtp_host=os.getenv("SMTP_HOST", "smtp.gmail.com").strip(),
+        smtp_port=int(os.getenv("SMTP_PORT", "587")),
+        smtp_user=smtp_user,
+        smtp_password=smtp_password,
+        from_email=os.getenv("FROM_EMAIL", smtp_user).strip(),
+        subject=os.getenv("MAIL_SUBJECT", "Abo Update").strip(),
+        body=os.getenv("MAIL_BODY", "hallo wordl"),
+    )
+
+
+def db_connect(db_path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(str(db_path))
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_user_subscription_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_subscriptions (
+            subscription_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            frequency TEXT NOT NULL DEFAULT 'weekly',
+            max_price_eur INTEGER NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_sent_at TEXT,
+            next_send_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_subscriptions_next_send ON user_subscriptions(next_send_at)"
+    )
+    connection.commit()
+
+
+def next_send_timestamp(frequency: str, now: datetime) -> str:
+    days = FREQUENCY_DAYS.get(frequency, 7)
+    return (now + timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def fetch_top_listings(
+    connection: sqlite3.Connection,
+    max_price_eur: int,
+    limit: int = 10,
+) -> list[sqlite3.Row]:
+    rows = connection.execute(
+        """
+        SELECT
+            listing_id,
+            title,
+            price_eur,
+            area_sqm,
+            rooms,
+            location,
+            url,
+            created_at,
+            ai_rating_score,
+            ai_rating_reason,
+            listing_quality_index,
+            listing_quality_grade
+        FROM listings
+        WHERE price_eur <= ?
+        ORDER BY
+            COALESCE(ai_rating_score, -1) DESC,
+            COALESCE(listing_quality_index, -1) DESC,
+            created_at DESC
+        LIMIT ?
+        """,
+        (max_price_eur, max(1, limit)),
+    ).fetchall()
+    return rows
+
+
+def render_listing_email(
+    recipient: str,
+    max_price_eur: int,
+    rows: list[sqlite3.Row],
+    intro: str,
+) -> tuple[str, str]:
+    safe_recipient = html.escape(recipient)
+    safe_intro = html.escape(intro)
+    safe_limit = html.escape(str(max_price_eur))
+
+    text_lines = [
+        f"Hallo {recipient},",
+        "",
+        intro,
+        f"Gefiltert bis {max_price_eur:,} EUR.".replace(",", "."),
+        "",
+    ]
+
+    items_html = []
+    if rows:
+        for index, row in enumerate(rows, start=1):
+            title = html.escape(str(row["title"] or "Ohne Titel"))
+            location = html.escape(str(row["location"] or "Unbekannt"))
+            url = html.escape(str(row["url"] or ""), quote=True)
+            price = row["price_eur"]
+            ai_score = row["ai_rating_score"]
+            quality_index = row["listing_quality_index"]
+            quality_grade = html.escape(str(row["listing_quality_grade"] or "-"))
+            reason = html.escape(str(row["ai_rating_reason"] or ""))
+            price_display = f"{price:,}".replace(",", ".")
+            
+            text_lines.extend(
+                [
+                    f"{index}. {row['title'] or 'Ohne Titel'}",
+                    f"   Preis: {price_display} EUR | Ort: {row['location'] or 'Unbekannt'}",
+                    f"   AI-Score: {ai_score if ai_score is not None else '-'} | Qualität: {quality_grade}",
+                    f"   Link: {row['url'] or '-'}",
+                    "",
+                ]
+            )
+            
+            items_html.append(
+                f"""
+            <div style="background:#ffffff;border-radius:8px;padding:24px;margin-bottom:16px;border:1px solid #e1e3e4;box-shadow:0 4px 20px rgba(0,0,0,0.04);transition:box-shadow 0.2s ease;">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;">
+                <div style="flex:1;">
+                  <h3 style="margin:0 0 8px 0;font-size:18px;font-weight:600;line-height:1.4;color:#001e19;font-family:Inter,sans-serif;">{title}</h3>
+                  <p style="margin:0;font-size:14px;color:#414846;font-family:Inter,sans-serif;">{location}</p>
+                </div>
+                <div style="text-align:right;margin-left:16px;">
+                  <span style="display:inline-block;background:#16332e;color:#ffffff;padding:6px 12px;border-radius:4px;font-size:13px;font-weight:500;letter-spacing:0.02em;font-family:Inter,sans-serif;">#{index}</span>
+                </div>
+              </div>
+              
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0;padding:16px 0;border-top:1px solid #edeeef;border-bottom:1px solid #edeeef;">
+                <div>
+                  <p style="margin:0 0 4px 0;font-size:12px;text-transform:uppercase;letter-spacing:0.08em;color:#727976;font-weight:500;font-family:Inter,sans-serif;">PREIS</p>
+                  <p style="margin:0;font-size:18px;font-weight:600;color:#001e19;font-family:Inter,sans-serif;">{price_display} EUR</p>
+                </div>
+                <div>
+                  <p style="margin:0 0 4px 0;font-size:12px;text-transform:uppercase;letter-spacing:0.08em;color:#727976;font-weight:500;font-family:Inter,sans-serif;">AI-BEWERTUNG</p>
+                  <p style="margin:0;font-size:18px;font-weight:600;color:#47645e;font-family:Inter,sans-serif;">{ai_score if ai_score is not None else '-'}/100</p>
+                </div>
+              </div>
+              
+              {f'<p style="margin:0 0 12px 0;font-size:14px;line-height:1.6;color:#414846;font-family:Inter,sans-serif;"><strong>Bewertung:</strong> {reason}</p>' if reason else ''}
+              
+              <a href="{url}" target="_blank" rel="noreferrer" style="display:inline-block;background:#16332e;color:#ffffff;padding:10px 20px;border-radius:6px;text-decoration:none;font-size:14px;font-weight:500;font-family:Inter,sans-serif;border:none;cursor:pointer;">Listing anschauen</a>
+            </div>
+                """
+            )
+    else:
+        text_lines.append("Keine passenden Listings gefunden.")
+
+    text_lines.extend(["", "Viele Grüße", "Dein Immobilien-Newsletter"])
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Immobilien Newsletter</title>
+  <style>
+    body {{ margin:0;padding:0;background:#f8f9fa;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI','Roboto','Oxygen','Ubuntu','Cantarell',sans-serif;color:#191c1d; }}
+    a {{ color:#16332e;text-decoration:none; }}
+    a:hover {{ text-decoration:underline; }}
+  </style>
+</head>
+<body>
+  <div style="max-width:600px;margin:0 auto;padding:32px 20px;background:#f8f9fa;">
+    
+    <!-- Header Section -->
+    <div style="background:linear-gradient(135deg,#001e19 0%,#16332e 100%);color:#ffffff;border-radius:8px;padding:32px 24px;margin-bottom:32px;box-shadow:0 4px 20px rgba(0,30,25,0.15);">
+      <p style="margin:0 0 12px 0;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;opacity:0.9;font-weight:500;font-family:Inter,sans-serif;">Immobilien-Newsletter</p>
+      <h1 style="margin:0 0 12px 0;font-size:32px;font-weight:600;line-height:1.2;letter-spacing:-0.01em;font-family:Inter,sans-serif;">Top Listings für Sie</h1>
+      <p style="margin:0;font-size:16px;line-height:1.6;opacity:0.95;font-family:Inter,sans-serif;">{safe_intro}</p>
+      <p style="margin:8px 0 0 0;font-size:14px;opacity:0.85;font-family:Inter,sans-serif;">Gefiltert bis <strong>{safe_limit} EUR</strong></p>
+    </div>
+
+    <!-- Listings Section -->
+    <div style="margin-bottom:32px;">
+      {''.join(items_html) if items_html else '<div style="background:#ffffff;border-radius:8px;padding:24px;text-align:center;color:#727976;border:1px solid #e1e3e4;font-family:Inter,sans-serif;"><p style="margin:0;">Keine passenden Listings gefunden.</p></div>'}
+    </div>
+
+    <!-- Footer Section -->
+    <div style="background:#ffffff;border-radius:8px;padding:24px;border:1px solid #e1e3e4;text-align:center;font-size:13px;color:#727976;font-family:Inter,sans-serif;line-height:1.6;">
+      <p style="margin:0 0 8px 0;">Viele Grüße,<br><strong>Dein Immobilien-Newsletter</strong></p>
+      <p style="margin:12px 0 0 0;padding-top:12px;border-top:1px solid #edeeef;font-size:12px;color:#a3a9a6;">
+        Diese E-Mail wurde speziell für Sie generiert basierend auf Ihren Suchkriterien.
+      </p>
+    </div>
+
+  </div>
+</body>
+</html>"""
+
+    text_body = "\n".join(text_lines)
+    return text_body, html_body
+
+
+def send_email(config: MailConfig, recipient: str, text_body: str, html_body: str) -> None:
+    message = EmailMessage()
+    message["From"] = config.from_email
+    message["To"] = recipient
+    message["Subject"] = config.subject
+    message.set_content(text_body)
+    message.add_alternative(html_body, subtype="html")
+
+    with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=30) as smtp:
+        smtp.starttls()
+        smtp.login(config.smtp_user, config.smtp_password)
+        smtp.send_message(message)
+
+
+def process_due_subscriptions(
+    connection: sqlite3.Connection,
+    config: MailConfig,
+    dry_run: bool,
+    limit: int,
+) -> tuple[int, int]:
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat(timespec="seconds")
+
+    rows = connection.execute(
+        """
+                SELECT subscription_id, email, frequency, max_price_eur
+        FROM user_subscriptions
+        WHERE is_active = 1
+          AND next_send_at <= ?
+        ORDER BY next_send_at ASC
+        LIMIT ?
+        """,
+        (now_iso, max(1, limit)),
+    ).fetchall()
+
+    sent = 0
+    failed = 0
+
+    for row in rows:
+        subscription_id = int(row["subscription_id"])
+        recipient = str(row["email"])
+        frequency = str(row["frequency"]).lower()
+        max_price_eur = int(row["max_price_eur"])
+        next_send_at = next_send_timestamp(frequency, now)
+        listings = fetch_top_listings(connection, max_price_eur, 10)
+        text_body, html_body = render_listing_email(
+            recipient=recipient,
+            max_price_eur=max_price_eur,
+            rows=listings,
+            intro=config.body,
+        )
+
+        try:
+            if dry_run:
+                print(f"[DRY RUN] Wuerde senden an: {recipient} mit {len(listings)} Listings")
+            else:
+                send_email(config, recipient, text_body, html_body)
+
+            connection.execute(
+                """
+                UPDATE user_subscriptions
+                SET last_sent_at = ?,
+                    updated_at = ?,
+                    next_send_at = ?
+                WHERE subscription_id = ?
+                """,
+                (now_iso, now_iso, next_send_at, subscription_id),
+            )
+            sent += 1
+            print(f"OK: Mail {'simuliert' if dry_run else 'gesendet'} an {recipient}")
+        except Exception as exc:
+            failed += 1
+            print(f"FEHLER: Versand an {recipient} fehlgeschlagen: {exc}")
+
+    connection.commit()
+    return sent, failed
+
+
+def main() -> int:
+    args = parse_args()
+    db_path = Path(args.db).expanduser()
+
+    load_dotenv_file(DOTENV_PATH)
+
+    if not db_path.exists():
+        print(f"Datenbank nicht gefunden: {db_path}")
+        return 1
+
+    config = get_mail_config()
+    if not args.dry_run and (not config.smtp_user or not config.smtp_password):
+        print("SMTP_USER und SMTP_PASSWORD muessen gesetzt sein.")
+        return 1
+
+    with db_connect(db_path) as connection:
+        initialize_user_subscription_table(connection)
+        sent, failed = process_due_subscriptions(connection, config, args.dry_run, args.limit)
+
+    print(f"Fertig. Erfolgreich: {sent}, Fehler: {failed}")
+    return 0 if failed == 0 else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
