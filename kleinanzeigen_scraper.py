@@ -6,7 +6,6 @@ import html
 import hashlib
 import os
 import re
-import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,10 +15,13 @@ from urllib.parse import urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 
+from db import db_connect, db_execute, fetch_value, is_sqlite_connection
+
 
 BASE_URL = "https://www.kleinanzeigen.de/s-wohnung-kaufen/stuttgart/preis::180000/c196l9280r50"
 BASE_DOMAIN = "https://www.kleinanzeigen.de"
 BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_DB_PATH = BASE_DIR / "kleinanzeigen_listings.db"
 DOTENV_PATH = BASE_DIR / ".env"
 OPENROUTER_BATCH_SIZE = 1
 
@@ -473,8 +475,9 @@ def parse_listings(html: str, crawl_timestamp: str) -> list[dict[str, Any]]:
     return records
 
 
-def initialize_database(connection: sqlite3.Connection) -> None:
-    connection.execute(
+def initialize_database(connection) -> None:
+    db_execute(
+        connection,
         """
         CREATE TABLE IF NOT EXISTS listings (
             listing_id TEXT PRIMARY KEY,
@@ -490,9 +493,10 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         """
     )
     ensure_listing_columns(connection)
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_listings_price ON listings(price_eur)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_listings_location ON listings(location)")
-    connection.execute(
+    db_execute(connection, "CREATE INDEX IF NOT EXISTS idx_listings_price ON listings(price_eur)")
+    db_execute(connection, "CREATE INDEX IF NOT EXISTS idx_listings_location ON listings(location)")
+    db_execute(
+        connection,
         """
         CREATE TABLE IF NOT EXISTS crawler_state (
             key TEXT PRIMARY KEY,
@@ -504,7 +508,7 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
-def ensure_listing_columns(connection: sqlite3.Connection) -> None:
+def ensure_listing_columns(connection) -> None:
     expected_columns: dict[str, str] = {
         "valuation_model": "TEXT",
         "valuation_run_at": "TEXT",
@@ -526,29 +530,43 @@ def ensure_listing_columns(connection: sqlite3.Connection) -> None:
         "ai_rating_error": "TEXT",
     }
 
-    existing = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(listings)").fetchall()
-    }
+    if is_sqlite_connection(connection):
+        existing = {
+            row[1]
+            for row in db_execute(connection, "PRAGMA table_info(listings)").fetchall()
+        }
+    else:
+        existing = {
+            fetch_value(row, "column_name")
+            for row in db_execute(
+                connection,
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'listings'
+                """,
+            ).fetchall()
+        }
 
     for column_name, column_type in expected_columns.items():
         if column_name not in existing:
-            connection.execute(f"ALTER TABLE listings ADD COLUMN {column_name} {column_type}")
+            db_execute(connection, f"ALTER TABLE listings ADD COLUMN {column_name} {column_type}")
 
 
-def get_crawler_state(connection: sqlite3.Connection, key: str) -> Optional[str]:
-    row = connection.execute("SELECT value FROM crawler_state WHERE key = ?", (key,)).fetchone()
+def get_crawler_state(connection, key: str) -> Optional[str]:
+    row = db_execute(connection, "SELECT value FROM crawler_state WHERE key = %s", (key,)).fetchone()
     if not row:
         return None
-    return row[0]
+    return fetch_value(row, "value", 0)
 
 
-def set_crawler_state(connection: sqlite3.Connection, key: str, value: str) -> None:
+def set_crawler_state(connection, key: str, value: str) -> None:
     updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    connection.execute(
+    db_execute(
+        connection,
         """
         INSERT INTO crawler_state (key, value, updated_at)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
         ON CONFLICT(key) DO UPDATE SET
             value = excluded.value,
             updated_at = excluded.updated_at
@@ -737,8 +755,9 @@ def compute_listing_quality_index(
     return index_value, grade, note
 
 
-def apply_mietspiegel_valuation(connection: sqlite3.Connection) -> int:
-    rows = connection.execute(
+def apply_mietspiegel_valuation(connection) -> int:
+    rows = db_execute(
+        connection,
         """
         SELECT
             listing_id,
@@ -778,12 +797,13 @@ def apply_mietspiegel_valuation(connection: sqlite3.Connection) -> int:
                 None,
                 0.10,
             )
-            connection.execute(
+            db_execute(
+                connection,
                 """
                 UPDATE listings
                 SET
-                    valuation_model = ?,
-                    valuation_run_at = ?,
+                    valuation_model = %s,
+                    valuation_run_at = %s,
                     est_cold_rent_sqm = NULL,
                     est_cold_rent_monthly = NULL,
                     est_cold_rent_min_monthly = NULL,
@@ -791,11 +811,11 @@ def apply_mietspiegel_valuation(connection: sqlite3.Connection) -> int:
                     gross_yield_pct = NULL,
                     price_to_rent_factor = NULL,
                     valuation_confidence = 0.10,
-                    valuation_note = ?,
-                    listing_quality_index = ?,
-                    listing_quality_grade = ?,
-                    listing_quality_note = ?
-                WHERE listing_id = ?
+                    valuation_note = %s,
+                    listing_quality_index = %s,
+                    listing_quality_grade = %s,
+                    listing_quality_note = %s
+                WHERE listing_id = %s
                 """,
                 (
                     "stuttgart_mietspiegel_heuristic_v1",
@@ -834,24 +854,25 @@ def apply_mietspiegel_valuation(connection: sqlite3.Connection) -> int:
             confidence,
         )
 
-        connection.execute(
+        db_execute(
+            connection,
             """
             UPDATE listings
             SET
-                valuation_model = ?,
-                valuation_run_at = ?,
-                est_cold_rent_sqm = ?,
-                est_cold_rent_monthly = ?,
-                est_cold_rent_min_monthly = ?,
-                est_cold_rent_max_monthly = ?,
-                gross_yield_pct = ?,
-                price_to_rent_factor = ?,
-                valuation_confidence = ?,
-                valuation_note = ?,
-                listing_quality_index = ?,
-                listing_quality_grade = ?,
-                listing_quality_note = ?
-            WHERE listing_id = ?
+                valuation_model = %s,
+                valuation_run_at = %s,
+                est_cold_rent_sqm = %s,
+                est_cold_rent_monthly = %s,
+                est_cold_rent_min_monthly = %s,
+                est_cold_rent_max_monthly = %s,
+                gross_yield_pct = %s,
+                price_to_rent_factor = %s,
+                valuation_confidence = %s,
+                valuation_note = %s,
+                listing_quality_index = %s,
+                listing_quality_grade = %s,
+                listing_quality_note = %s
+            WHERE listing_id = %s
             """,
             (
                 "stuttgart_mietspiegel_heuristic_v1",
@@ -876,7 +897,7 @@ def apply_mietspiegel_valuation(connection: sqlite3.Connection) -> int:
     return updated
 
 
-def apply_openrouter_valuation(connection: sqlite3.Connection) -> int:
+def apply_openrouter_valuation(connection) -> int:
     config = get_openrouter_config()
     if config is None:
         print("OpenRouter-Konfiguration unvollständig, AI-Bewertung wird übersprungen.")
@@ -884,7 +905,8 @@ def apply_openrouter_valuation(connection: sqlite3.Connection) -> int:
 
     updated = 0
     while True:
-        rows = connection.execute(
+        rows = db_execute(
+            connection,
             """
             SELECT
                 listing_id,
@@ -900,7 +922,7 @@ def apply_openrouter_valuation(connection: sqlite3.Connection) -> int:
             FROM listings
             WHERE ai_rating_run_at IS NULL
             ORDER BY created_at DESC, listing_id DESC
-            LIMIT ?
+            LIMIT %s
             """,
             (OPENROUTER_BATCH_SIZE,),
         ).fetchall()
@@ -929,11 +951,12 @@ def apply_openrouter_valuation(connection: sqlite3.Connection) -> int:
         except Exception as exc:
             error_message = str(exc)
             print(f"OpenRouter-Bewertung fehlgeschlagen: {error_message}")
-            connection.execute(
+            db_execute(
+                connection,
                 """
                 UPDATE listings
-                SET ai_rating_error = ?
-                WHERE listing_id = ?
+                SET ai_rating_error = %s
+                WHERE listing_id = %s
                 """,
                 (error_message[:500], listings[0]["listing_id"]),
             )
@@ -942,15 +965,16 @@ def apply_openrouter_valuation(connection: sqlite3.Connection) -> int:
 
         run_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for rating in ratings:
-            connection.execute(
+            db_execute(
+                connection,
                 """
                 UPDATE listings
-                SET ai_rating_model = ?,
-                    ai_rating_run_at = ?,
-                    ai_rating_score = ?,
-                    ai_rating_reason = ?,
+                SET ai_rating_model = %s,
+                    ai_rating_run_at = %s,
+                    ai_rating_score = %s,
+                    ai_rating_reason = %s,
                     ai_rating_error = NULL
-                WHERE listing_id = ?
+                WHERE listing_id = %s
                 """,
                 (
                     config["model_name"],
@@ -967,8 +991,9 @@ def apply_openrouter_valuation(connection: sqlite3.Connection) -> int:
     return updated
 
 
-def insert_listing(connection: sqlite3.Connection, listing: dict[str, Any]) -> bool:
-    cursor = connection.execute(
+def insert_listing(connection, listing: dict[str, Any]) -> bool:
+    cursor = db_execute(
+        connection,
         """
         INSERT INTO listings (
             listing_id,
@@ -981,26 +1006,27 @@ def insert_listing(connection: sqlite3.Connection, listing: dict[str, Any]) -> b
             description,
             created_at
         )
-        VALUES (
-            :listing_id,
-            :title,
-            :price_eur,
-            :area_sqm,
-            :rooms,
-            :location,
-            :url,
-            :description,
-            :created_at
-        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT(listing_id) DO NOTHING
         """,
-        listing,
+        (
+            listing["listing_id"],
+            listing["title"],
+            listing["price_eur"],
+            listing["area_sqm"],
+            listing["rooms"],
+            listing["location"],
+            listing["url"],
+            listing["description"],
+            listing["created_at"],
+        ),
     )
     return cursor.rowcount == 1
 
 
-def purge_invalid_listings(connection: sqlite3.Connection) -> int:
-    cursor = connection.execute(
+def purge_invalid_listings(connection) -> int:
+    cursor = db_execute(
+        connection,
         """
         DELETE FROM listings
         WHERE title IS NULL
@@ -1023,7 +1049,7 @@ def crawl(base_url: str, database_path: str, max_pages: Optional[int], delay_sec
         }
     )
 
-    with sqlite3.connect(database_path) as connection:
+    with db_connect(DEFAULT_DB_PATH, database_path) as connection:
         initialize_database(connection)
         previous_marker = get_crawler_state(connection, "last_seen_listing_id")
         if previous_marker:
@@ -1113,10 +1139,14 @@ def crawl(base_url: str, database_path: str, max_pages: Optional[int], delay_sec
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Kleinanzeigen-Listings (Wohnung kaufen) crawlen und in SQLite speichern"
+        description="Kleinanzeigen-Listings (Wohnung kaufen) crawlen und in die konfigurierte Datenbank speichern"
     )
     parser.add_argument("--base-url", default=BASE_URL, help="Basis-URL der Suche")
-    parser.add_argument("--db", default="kleinanzeigen_listings.db", help="SQLite-Dateipfad")
+    parser.add_argument(
+        "--db",
+        default=os.getenv("DB_PATH", str(DEFAULT_DB_PATH)),
+        help="Optionaler SQLite-Pfad (wird ignoriert, wenn DATABASE_URL gesetzt ist)",
+    )
     parser.add_argument("--max-pages", type=int, default=None, help="Optionale Begrenzung der Seitenzahl")
     parser.add_argument("--delay", type=float, default=1.0, help="Pause zwischen Seitenabrufen in Sekunden")
     return parser.parse_args()

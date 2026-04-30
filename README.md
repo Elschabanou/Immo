@@ -88,6 +88,86 @@ Optionale Parameter:
 - `--delay <sekunden>`: Pause zwischen Seitenabrufen (Standard: `1.0`)
 - `--base-url <url>`: alternative Such-URL
 
+## PostgreSQL-Migration (Render-ready)
+
+Der Code unterstuetzt jetzt beide Modi:
+
+- Wenn `DATABASE_URL` gesetzt ist: PostgreSQL wird verwendet.
+- Wenn `DATABASE_URL` nicht gesetzt ist: SQLite (wie bisher) wird verwendet.
+
+### 1) Abhaengigkeiten aktualisieren
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2) SQLite nach PostgreSQL migrieren
+
+Setze lokal `DATABASE_URL` auf deine PostgreSQL-Verbindung und starte dann:
+
+```bash
+python migrate_sqlite_to_postgres.py --sqlite kleinanzeigen_listings.db
+```
+
+Optional:
+
+```bash
+python migrate_sqlite_to_postgres.py --sqlite kleinanzeigen_listings.db --batch-size 1000
+```
+
+### 3) Lokal gegen PostgreSQL testen
+
+```bash
+python app.py
+python kleinanzeigen_scraper.py --max-pages 1
+python send_subscription_emails.py --dry-run
+```
+
+## Render Deployment
+
+Optional kannst du auch direkt per Blueprint deployen (Datei `render.yaml` ist im Repo enthalten).
+
+### Web Service
+
+- Build Command:
+
+```bash
+pip install -r requirements.txt
+```
+
+- Start Command:
+
+```bash
+gunicorn app:app --bind 0.0.0.0:$PORT
+```
+
+### Cron Jobs
+
+- Scraper-Job (z. B. alle 2-4 Stunden):
+
+```bash
+python kleinanzeigen_scraper.py
+```
+
+- Mail-Job (z. B. alle 15-30 Minuten):
+
+```bash
+python send_subscription_emails.py
+```
+
+### Notwendige Render ENV Variablen
+
+- `DATABASE_URL`
+- `SMTP_USER`
+- `SMTP_PASSWORD`
+- `SMTP_HOST` (optional, default `smtp.gmail.com`)
+- `SMTP_PORT` (optional, default `587`)
+- `FROM_EMAIL` (optional)
+- `API_KEY`
+- `OPENROUTER_API_URL`
+- `MODEL_NAME`
+- Optional: `MAIL_SUBJECT`, `MAIL_BODY`
+
 ## Gespeicherte Felder
 
 Tabelle `listings`:
