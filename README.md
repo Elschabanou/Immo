@@ -1,3 +1,5 @@
+[![Netlify Status](https://api.netlify.com/api/v1/badges/a7ec0eae-415b-4411-a4a3-e7ad0b1550f2/deploy-status)](https://app.netlify.com/projects/immosuggest/deploys)
+
 # Kleinanzeigen Immobilien-Scraper (Stuttgart, Eigentumswohnungen)
 
 Dieses Skript crawlt Kleinanzeigen-Listings für Eigentumswohnungen in Stuttgart (max. 180.000 €, Umkreis 50 km) über die Suchseiten-Pagination und speichert die Daten in SQLite.

@@ -2,3 +2,8 @@
   base = "frontend"
   publish = "out"
   command = "npm ci && npm run build"
+
+[[redirects]]
+  from = "/subscriptions/manage"
+  to = "/subscriptions/manage.html"
+  status = 200

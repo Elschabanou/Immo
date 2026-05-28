@@ -1,0 +1,35 @@
+app = "immo-web"
+primary_region = "fra"
+
+[build]
+  builder = "paketobuildpacks"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 5000
+  processes = ["app"]
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.tcp_checks]
+    enabled = true
+    grace_period = "5s"
+    interval = "15s"
+    timeout = "10s"
+
+[env]
+  PYTHONUNBUFFERED = "true"
+
+[processes]
+  app = "gunicorn app:app --bind 0.0.0.0:5000"
