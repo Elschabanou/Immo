@@ -3,6 +3,9 @@
   publish = "out"
   command = "npm ci && npm run build"
 
+[build.environment]
+  NEXT_PUBLIC_API_BASE = "https://immo-web.onrender.com"
+
 [[redirects]]
   from = "/subscriptions/manage"
   to = "/subscriptions/manage.html"

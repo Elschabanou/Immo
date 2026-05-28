@@ -129,6 +129,34 @@ python send_subscription_emails.py --dry-run
 
 Optional kannst du auch direkt per Blueprint deployen (Datei `render.yaml` ist im Repo enthalten).
 
+### Zielbild
+
+- Backend: `immo-web` auf Render
+- Crawler: Cron Job auf Render
+- Mailer: Cron Job auf Render
+- Frontend: Netlify, das über `NEXT_PUBLIC_API_BASE` auf das Render-Backend zeigt
+
+### 1) Render-Backend deployen
+
+1. Öffne https://dashboard.render.com/blueprints
+2. Verbinde dein GitHub-Repository
+3. Render erstellt die Services aus `render.yaml`
+4. Trage im Web Service und in beiden Cron Jobs `DATABASE_URL` ein
+5. Falls du SMTP und OpenRouter brauchst, setze auch `SMTP_USER`, `SMTP_PASSWORD`, `API_KEY`, `OPENROUTER_API_URL` und `MODEL_NAME`
+
+### 2) Frontend mit dem Backend verbinden
+
+1. Deploye das Frontend aus dem Ordner `frontend/` weiter auf Netlify
+2. Nutze die bereits gesetzte Build-Variable `NEXT_PUBLIC_API_BASE=https://immo-web.onrender.com`
+3. Danach zeigen die Frontend-Aufrufe auf die Render-API statt auf die lokale Domain
+
+### 3) Testen
+
+1. Rufe die Render-URL des Web Service auf
+2. Teste im Frontend das Anlegen eines Abos
+3. Öffne `/subscriptions/manage` und prüfe, ob die Liste lädt
+4. Schau in die Render-Logs für Scraper und Mailer, wenn Jobs nicht laufen
+
 ### Web Service
 
 - Build Command:

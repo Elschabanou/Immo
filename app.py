@@ -22,6 +22,14 @@ FREQUENCY_DAYS = {
 app = Flask(__name__)
 
 
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    return response
+
+
 def initialize_user_subscription_table(connection) -> None:
     subscription_id_definition = (
         "INTEGER PRIMARY KEY AUTOINCREMENT"
@@ -64,6 +72,11 @@ def next_send_timestamp(frequency: str) -> str:
 @app.route("/")
 def index() -> str:
     return render_template("index.html")
+
+
+@app.route("/api/<path:_path>", methods=["OPTIONS"])
+def api_options(_path: str):
+    return ("", 204)
 
 
 @app.route("/subscriptions/manage")

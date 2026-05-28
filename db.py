@@ -17,8 +17,39 @@ class DatabaseConfigurationError(RuntimeError):
     pass
 
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+
+            os.environ[key] = value.strip().strip('"').strip("'")
+
+
 def get_database_url() -> str:
-    return os.getenv("DATABASE_URL", "").strip()
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if database_url:
+        return database_url
+
+    for candidate in (BASE_DIR / ".env", BASE_DIR / ".env.production"):
+        load_env_file(candidate)
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if database_url:
+            return database_url
+
+    return ""
 
 
 def db_connect(default_sqlite_path: Path, sqlite_override: str | None = None):
